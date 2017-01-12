@@ -7,12 +7,13 @@ import (
 	"encoding/base64"
 	//"errors"
 	"fmt"
-	"github.com/BurntSushi/migration"
-	_ "github.com/lib/pq" // Tested against 04c77ed03f9b391050bec3b5f2f708f204df48b2 (Sep 16, 2014)
-	"golang.org/x/crypto/scrypt"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/migration"
+	_ "github.com/lib/pq" // Tested against 04c77ed03f9b391050bec3b5f2f708f204df48b2 (Sep 16, 2014)
+	"golang.org/x/crypto/scrypt"
 )
 
 /*
@@ -145,10 +146,34 @@ func (x *sqlUserStoreDB) identityExists(identity string) error {
 	return identityFromRow(row)
 }
 
-func (x *sqlUserStoreDB) emailOrUsernameExistExcludingUserid(email string, username string, userid UserId) error {
+func (x *sqlUserStoreDB) filterOutUserIds(sql string, userIds []UserId) string {
+	filterTemplate := "AND userid != %d"
+	for count := 0; count < len(userIds); count++ {
+		filter := fmt.Sprintf(filterTemplate, userIds[count])
+		joinArg := []string{sql, filter}
+		sql = strings.Join(joinArg, " ")
+	}
+	return sql
+}
+
+func (x *sqlUserStoreDB) emailOrUsernameExistExcludingUserids(email string, username string, userids []UserId) error {
 	var row *sql.Row
-	var sql = fmt.Sprintf("SELECT userid FROM authuserstore WHERE (LOWER(email) = $1 OR LOWER(username) = $2) AND (archived = false OR archived IS NULL) AND userid != %d", userid);
+	sql := x.filterOutUserIds("SELECT userid FROM authuserstore WHERE (LOWER(email) = $1 OR LOWER(username) = $2) AND (archived = false OR archived IS NULL)", userids)
 	row = x.db.QueryRow(sql, CanonicalizeIdentity(email), CanonicalizeIdentity(username))
+	return identityFromRow(row)
+}
+
+func (x *sqlUserStoreDB) emailExistExcludingUserids(email string, userids []UserId) error {
+	var row *sql.Row
+	sql := x.filterOutUserIds("SELECT userid FROM authuserstore WHERE (LOWER(email) = $1) AND (archived = false OR archived IS NULL)", userids)
+	row = x.db.QueryRow(sql, CanonicalizeIdentity(email))
+	return identityFromRow(row)
+}
+
+func (x *sqlUserStoreDB) usernameExistExcludingUserids(username string, userids []UserId) error {
+	var row *sql.Row
+	sql := x.filterOutUserIds("SELECT userid FROM authuserstore WHERE (LOWER(username) = $1) AND (archived = false OR archived IS NULL)", userids)
+	row = x.db.QueryRow(sql, CanonicalizeIdentity(username))
 	return identityFromRow(row)
 }
 
@@ -157,6 +182,29 @@ func (x *sqlUserStoreDB) emailOrUsernameExist(email string, username string) err
 	var sql = fmt.Sprintf("SELECT userid FROM authuserstore WHERE (LOWER(email) = $1 OR LOWER(username) = $2) AND (archived = false OR archived IS NULL)")
 	row = x.db.QueryRow(sql, CanonicalizeIdentity(email), CanonicalizeIdentity(username))
 	return identityFromRow(row)
+}
+
+// Checks that either a valid email, or a valid username exists from the
+// given input, without checking any member of the intended target userIds
+func (x *sqlUserStoreDB) checkIdentityExistsExcludingUserId(email string, username string, userIds []UserId) error {
+
+	checkEmail := &email != nil && len(email) > 0
+	checkUsername := &username != nil && len(username) > 0
+
+	if !checkEmail && !checkUsername {
+		return ErrIdentityEmpty
+	}
+
+	var err error
+	// emails may be blank (a legacy requirement), in which case we don't check if they exist
+	if checkEmail && checkUsername {
+		err = x.emailOrUsernameExistExcludingUserids(email, username, userIds)
+	} else if !checkEmail && checkUsername {
+		err = x.usernameExistExcludingUserids(username, userIds)
+	} else {
+		err = x.emailExistExcludingUserids(email, userIds)
+	}
+	return err
 }
 
 func identityFromRow(row *sql.Row) error {
@@ -177,15 +225,9 @@ func (x *sqlUserStoreDB) CreateIdentity(email, username, firstname, lastname, mo
 		return NullUserId, ehash
 	}
 
-	// we assume email address exists and is validated
-	if &username != nil && len(username) > 0 {
-		if err := x.emailOrUsernameExist(email, username); err != nil {
-			return NullUserId, err
-		}
-	} else {
-		if err := x.identityExists(email); err != nil {
-			return NullUserId, err
-		}
+	err := x.checkIdentityExistsExcludingUserId(email, username, []UserId{})
+	if err != nil {
+		return NullUserId, ErrIdentityExists
 	}
 
 	// Insert into user store
@@ -194,6 +236,7 @@ func (x *sqlUserStoreDB) CreateIdentity(email, username, firstname, lastname, mo
 			tx.Rollback()
 			return NullUserId, eCreateUserStore
 		}
+
 		// Get user id
 		var userId int64
 		if len(username) > 0 {
@@ -233,15 +276,9 @@ func (x *sqlUserStoreDB) CreateIdentity(email, username, firstname, lastname, mo
 
 func (x *sqlUserStoreDB) UpdateIdentity(userId UserId, email, username, firstname, lastname, mobilenumber string, authUserType AuthUserType) error {
 
-	// we assume email address exists and is validated
-	if &username != nil && len(username) > 0 {
-		if err := x.emailOrUsernameExistExcludingUserid(email, username, userId); err != nil {
-			return ErrIdentityExists
-		}
-	} else {
-		if err := x.identityExists(email); err != nil {
-			return ErrIdentityExists
-		}
+	err := x.checkIdentityExistsExcludingUserId(email, username, []UserId{userId})
+	if err != nil {
+		return ErrIdentityExists
 	}
 
 	if tx, etx := x.db.Begin(); etx == nil {
@@ -301,7 +338,6 @@ func (x *sqlUserStoreDB) RenameIdentity(oldIdent, newIdent string) error {
 		return etx
 	}
 }
-
 
 func (x *sqlUserStoreDB) GetIdentities() ([]AuthUser, error) {
 	rows, err := x.db.Query("SELECT userid, email, username, firstname, lastname, mobile, authusertype FROM authuserstore WHERE (archived = false OR archived IS NULL)")
@@ -406,7 +442,7 @@ func (x *sqlSessionDB) Read(sessionkey string) (*Token, error) {
 				return nil, ErrInvalidSessionToken
 			}
 			if &user.Email != nil {
-				token.Identity =  user.Email
+				token.Identity = user.Email
 			} else if &user.Username != nil {
 				token.Identity = user.Username
 			}
@@ -729,7 +765,7 @@ func createMigrations() []migration.Migrator {
 			FROM authuserstore
 			WHERE authuserstore.email = authsession.identity;
 		ALTER TABLE authsession DROP COLUMN identity;
-	
+
 		CREATE TABLE authuserpwd(userid BIGINT PRIMARY KEY, password VARCHAR, permit VARCHAR, pwdtoken VARCHAR);
 		INSERT INTO authuserpwd (userid, password, permit, pwdtoken)
 			SELECT store.userid, password, permit, pwdtoken
